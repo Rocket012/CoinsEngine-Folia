@@ -3,19 +3,20 @@ package su.nightexpress.coinsengine.user;
 import org.jetbrains.annotations.NotNull;
 import su.nightexpress.coinsengine.api.currency.Currency;
 
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class UserBalance {
 
     private final Map<String, Double> balanceMap;
 
     public UserBalance() {
-        this(new HashMap<>());
+        this(new ConcurrentHashMap<>());
     }
 
     public UserBalance(@NotNull Map<String, Double> balanceMap) {
-        this.balanceMap = balanceMap;
+        // Use ConcurrentHashMap for thread-safety
+        this.balanceMap = new ConcurrentHashMap<>(balanceMap);
     }
 
     @NotNull

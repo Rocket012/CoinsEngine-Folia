@@ -248,14 +248,17 @@ public class EconomyCurrency extends AbstractCurrency implements Economy {
             return new EconomyResponse(amount, 0, EconomyResponse.ResponseType.FAILURE, Lang.ECONOMY_ERROR_INVALID_PLAYER.text());
         }
 
-        if (!user.hasEnough(this, amount)) {
-            return new EconomyResponse(amount, user.getBalance(this), EconomyResponse.ResponseType.FAILURE, Lang.ECONOMY_ERROR_INSUFFICIENT_FUNDS.text());
+        // Synchronize balance check and withdrawal to prevent race conditions
+        synchronized (user.getBalance()) {
+            if (!user.hasEnough(this, amount)) {
+                return new EconomyResponse(amount, user.getBalance(this), EconomyResponse.ResponseType.FAILURE, Lang.ECONOMY_ERROR_INSUFFICIENT_FUNDS.text());
+            }
+
+            OperationResult result = this.plugin.getCurrencyManager().remove(this.operationContext(), user, this, amount);
+            EconomyResponse.ResponseType type = result == OperationResult.SUCCESS ? EconomyResponse.ResponseType.SUCCESS : EconomyResponse.ResponseType.FAILURE;
+
+            return new EconomyResponse(amount, user.getBalance(this), type, null);
         }
-
-        OperationResult result = this.plugin.getCurrencyManager().remove(this.operationContext(), user, this, amount);
-        EconomyResponse.ResponseType type = result == OperationResult.SUCCESS ? EconomyResponse.ResponseType.SUCCESS : EconomyResponse.ResponseType.FAILURE;
-
-        return new EconomyResponse(amount, user.getBalance(this), type, null);
     }
 
     @NotNull
