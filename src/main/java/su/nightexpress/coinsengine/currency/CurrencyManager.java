@@ -386,8 +386,11 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
 
         OperationExecutor executor = context.getExecutor();
 
-        user.addBalance(currency, amount);
-        this.userManager.save(user);
+        // Synchronize balance modification and save to prevent race conditions
+        synchronized (user.getBalance()) {
+            user.addBalance(currency, amount);
+            this.userManager.save(user);
+        }
 
         if (this.logger != null && context.shouldNotifyLogger()) {
             this.logger.addEntry(context, "[%s] %s gave %s to %s. New balance: %s"
@@ -429,8 +432,11 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
             Player target = user.getPlayer();
             if (target == null) return; // Only online players should be affected.
 
-            user.addBalance(currency, amount);
-            this.userManager.save(user);
+            // Synchronize balance modification and save to prevent race conditions
+            synchronized (user.getBalance()) {
+                user.addBalance(currency, amount);
+                this.userManager.save(user);
+            }
 
             if (context.shouldNotify(NotificationTarget.USER)) {
                 currency.sendPrefixed(Lang.COMMAND_CURRENCY_GIVE_NOTIFY, target, replacer -> replacer
@@ -468,8 +474,11 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
 
         OperationExecutor executor = context.getExecutor();
 
-        user.removeBalance(currency, amount);
-        this.userManager.save(user);
+        // Synchronize balance modification and save to prevent race conditions
+        synchronized (user.getBalance()) {
+            user.removeBalance(currency, amount);
+            this.userManager.save(user);
+        }
 
         if (this.logger != null && context.shouldNotifyLogger()) {
             this.logger.addEntry(context, "[%s] %s took %s from %s's balance. New balance: %s"
@@ -509,8 +518,11 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
 
         OperationExecutor executor = context.getExecutor();
 
-        user.setBalance(currency, amount);
-        this.userManager.save(user);
+        // Synchronize balance modification and save to prevent race conditions
+        synchronized (user.getBalance()) {
+            user.setBalance(currency, amount);
+            this.userManager.save(user);
+        }
 
         if (this.logger != null && context.shouldNotifyLogger()) {
             this.logger.addEntry(context, "[%s] %s set %s's balance to %s. New balance: %s"
@@ -551,8 +563,11 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
 
         OperationExecutor executor = context.getExecutor();
 
-        user.resetBalance(currency);
-        this.userManager.save(user);
+        // Synchronize balance modification and save to prevent race conditions
+        synchronized (user.getBalance()) {
+            user.resetBalance(currency);
+            this.userManager.save(user);
+        }
 
         if (this.logger != null && context.shouldNotifyLogger()) {
             this.logger.addEntry(context, "[%s] %s reset %s's balance of %s to %s."
@@ -599,6 +614,7 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
             return false;
         }
 
+        // Initial balance check (will be re-verified inside the synchronized block)
         CoinsUser fromUser = this.userManager.getOrFetch(sender);
         if (amount > fromUser.getBalance(currency)) {
             currency.sendPrefixed(Lang.CURRENCY_SEND_ERROR_NOT_ENOUGH, sender);
@@ -619,11 +635,29 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
                 return;
             }
 
-            targetUser.addBalance(currency, amount);
-            fromUser.removeBalance(currency, amount);
+            // Acquire locks in consistent order (by UUID) to prevent deadlocks
+            Object lock1 = fromUser.getId().compareTo(targetUser.getId()) < 0 ? fromUser.getBalance() : targetUser.getBalance();
+            Object lock2 = fromUser.getId().compareTo(targetUser.getId()) < 0 ? targetUser.getBalance() : fromUser.getBalance();
 
-            this.userManager.save(targetUser);
-            this.userManager.save(fromUser);
+            // Synchronized block on both users' balances to prevent race conditions
+            synchronized (lock1) {
+                synchronized (lock2) {
+                    // Re-verify balance to prevent duplication from concurrent requests
+                    if (amount > fromUser.getBalance(currency)) {
+                        currency.sendPrefixed(Lang.CURRENCY_SEND_ERROR_NOT_ENOUGH, sender);
+                        return;
+                    }
+
+                    // Remove from sender FIRST (fail-safe: prevents money creation if crash occurs)
+                    fromUser.removeBalance(currency, amount);
+                    // Save sender immediately after deduction
+                    this.userManager.save(fromUser);
+
+                    // Then add to recipient
+                    targetUser.addBalance(currency, amount);
+                    this.userManager.save(targetUser);
+                }
+            }
 
             currency.sendPrefixed(Lang.CURRENCY_SEND_DONE_SENDER, sender, replacer -> replacer
                 .replace(Placeholders.GENERIC_AMOUNT, currency.format(amount))
@@ -639,14 +673,16 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
                 );
             });
 
-            this.logger.addEntry(context, "[%s] %s paid %s to %s. New balances: %s and %s.".formatted(
-                currency.getId(),
-                sender.getName(),
-                currency.format(amount),
-                targetUser.getName(),
-                currency.format(fromUser.getBalance(currency)),
-                currency.format(targetUser.getBalance(currency))
-            ));
+            if (this.logger != null) {
+                this.logger.addEntry(context, "[%s] %s paid %s to %s. New balances: %s and %s.".formatted(
+                    currency.getId(),
+                    sender.getName(),
+                    currency.format(amount),
+                    targetUser.getName(),
+                    currency.format(fromUser.getBalance(currency)),
+                    currency.format(targetUser.getBalance(currency))
+                ));
+            }
         });
 
         return true;
@@ -669,55 +705,62 @@ public class CurrencyManager extends AbstractManager<CoinsEnginePlugin> {
         }
 
         CoinsUser user = this.userManager.getOrFetch(player);
-        if (user.getBalance(sourceCurrency) < amount) {
-            sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_LOW_BALANCE, player, replacer -> replacer
-                .replace(Placeholders.GENERIC_AMOUNT, sourceCurrency.format(amount))
-            );
-            return false;
-        }
+        
+        // Synchronize to prevent race conditions during exchange
+        synchronized (user.getBalance()) {
+            if (user.getBalance(sourceCurrency) < amount) {
+                sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_LOW_BALANCE, player, replacer -> replacer
+                    .replace(Placeholders.GENERIC_AMOUNT, sourceCurrency.format(amount))
+                );
+                return false;
+            }
 
-        if (!sourceCurrency.canExchangeTo(targetCurrency)) {
-            sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_NO_RATE, player, replacer -> replacer
-                .replace(Placeholders.GENERIC_NAME, targetCurrency.getName())
-            );
-            return false;
-        }
+            if (!sourceCurrency.canExchangeTo(targetCurrency)) {
+                sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_NO_RATE, player, replacer -> replacer
+                    .replace(Placeholders.GENERIC_NAME, targetCurrency.getName())
+                );
+                return false;
+            }
 
-        double result = sourceCurrency.getExchangeResult(targetCurrency, amount);
-        if (result <= 0D) {
-            sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_LOW_AMOUNT, player);
-            return false;
-        }
+            double result = sourceCurrency.getExchangeResult(targetCurrency, amount);
+            if (result <= 0D) {
+                sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_LOW_AMOUNT, player);
+                return false;
+            }
 
-        double newBalance = user.getBalance(targetCurrency) + result;
-        if (!targetCurrency.isUnderLimit(newBalance)) {
-            targetCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_LIMIT_EXCEED, player, replacer -> replacer
+            double newBalance = user.getBalance(targetCurrency) + result;
+            if (!targetCurrency.isUnderLimit(newBalance)) {
+                targetCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_ERROR_LIMIT_EXCEED, player, replacer -> replacer
+                    .replace(Placeholders.GENERIC_AMOUNT, targetCurrency.format(result))
+                    .replace(Placeholders.GENERIC_MAX, targetCurrency.format(targetCurrency.getMaxValue()))
+                );
+                return false;
+            }
+
+            // Remove source balance FIRST (fail-safe approach)
+            user.removeBalance(sourceCurrency, amount);
+            user.addBalance(targetCurrency, result);
+            this.userManager.save(user);
+
+            sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_SUCCESS, player, replacer -> replacer
+                .replace(Placeholders.GENERIC_BALANCE, sourceCurrency.format(amount))
                 .replace(Placeholders.GENERIC_AMOUNT, targetCurrency.format(result))
-                .replace(Placeholders.GENERIC_MAX, targetCurrency.format(targetCurrency.getMaxValue()))
             );
-            return false;
+
+            if (this.logger != null) {
+                this.logger.addEntry(context, "[%s] %s exchanged %s for %s [%s]. New balances: %s and %s."
+                    .formatted(
+                        sourceCurrency.getId(),
+                        user.getName(),
+                        sourceCurrency.format(amount),
+                        targetCurrency.format(result),
+                        targetCurrency.getId(),
+                        sourceCurrency.format(user.getBalance(sourceCurrency)),
+                        targetCurrency.format(user.getBalance(targetCurrency))
+                    )
+                );
+            }
         }
-
-        user.removeBalance(sourceCurrency, amount);
-        user.addBalance(targetCurrency, result);
-        this.userManager.save(user);
-
-        sourceCurrency.sendPrefixed(Lang.CURRENCY_EXCHANGE_SUCCESS, player, replacer -> replacer
-            .replace(Placeholders.GENERIC_BALANCE, sourceCurrency.format(amount))
-            .replace(Placeholders.GENERIC_AMOUNT, targetCurrency.format(result))
-        );
-
-        this.logger.addEntry(context, "[%s] %s exchanged %s for %s [%s]. New balances: %s and %s."
-            .formatted(
-                sourceCurrency.getId(),
-                user.getName(),
-                sourceCurrency.format(amount),
-                targetCurrency.format(result),
-                targetCurrency.getId(),
-                sourceCurrency.format(user.getBalance(sourceCurrency)),
-                targetCurrency.format(user.getBalance(targetCurrency))
-            )
-        );
 
         return true;
     }
